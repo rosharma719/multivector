@@ -53,6 +53,8 @@ struct QueryRequest {
     top_k: usize,
     candidates: Option<usize>,
     probes: Option<usize>,
+    candidate_backend: Option<String>,
+    ef_search: Option<usize>,
 }
 #[derive(Deserialize)]
 struct TrainRequest {
@@ -66,6 +68,13 @@ struct ScoreRequest {
     document: Option<Vec<Vec<f32>>>,
     id: Option<String>,
 }
+#[derive(Deserialize)]
+struct BuildAnnRequest {
+    #[serde(default = "sixteen")]
+    m: usize,
+    #[serde(default = "two_fifty_six")]
+    ef_construct: usize,
+}
 fn ten() -> usize {
     10
 }
@@ -74,6 +83,12 @@ fn null() -> Value {
 }
 fn twenty() -> usize {
     20
+}
+fn sixteen() -> usize {
+    16
+}
+fn two_fifty_six() -> usize {
+    256
 }
 
 struct ApiError(IndexError);
@@ -119,10 +134,26 @@ async fn query(
     State(index): State<Arc<MultiVectorIndex>>,
     Json(body): Json<QueryRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(json!({"matches": match body.probes {
-        Some(probes) => index.query_with_probes(&body.vectors, body.top_k, body.candidates, probes)?,
-        None => index.query(&body.vectors, body.top_k, body.candidates)?,
-    }})))
+    let matches = match body.candidate_backend.as_deref() {
+        Some("hnsw") => index.query_with_fde_ann(
+            &body.vectors,
+            body.top_k,
+            body.candidates,
+            body.ef_search.unwrap_or(256),
+        )?,
+        Some("muvera") | None => match body.probes {
+            Some(probes) => {
+                index.query_with_probes(&body.vectors, body.top_k, body.candidates, probes)?
+            }
+            None => index.query(&body.vectors, body.top_k, body.candidates)?,
+        },
+        Some(other) => {
+            return Err(ApiError(IndexError::Invalid(format!(
+                "unknown candidate backend: {other}"
+            ))));
+        }
+    };
+    Ok(Json(json!({"matches": matches})))
 }
 async fn train(
     State(index): State<Arc<MultiVectorIndex>>,
@@ -147,6 +178,14 @@ async fn score(
     };
     Ok(Json(json!({"score": score})))
 }
+async fn build_ann(
+    State(index): State<Arc<MultiVectorIndex>>,
+    Json(body): Json<BuildAnnRequest>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({"nodes": index.build_fde_ann(body.m, body.ef_construct)?}),
+    ))
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -166,6 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/stats", get(stats))
         .route("/v1/train", post(train))
         .route("/v1/debug/score", post(score))
+        .route("/v1/fde/index", post(build_ann))
         .route("/v1/vectors/upsert", post(upsert))
         .route("/v1/query", post(query))
         // ColBERT batches are legitimately large: 100 documents can contain

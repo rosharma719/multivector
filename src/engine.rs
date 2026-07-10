@@ -6,6 +6,7 @@ use crate::{
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 use std::{
     collections::{HashMap, HashSet},
     fs, io,
@@ -13,6 +14,10 @@ use std::{
     sync::RwLock,
 };
 use thiserror::Error;
+use vectordb::{
+    utils::types::DistanceMetric,
+    vector::hnsw::{HNSWIndex, SearchRuntimeOptions},
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct IndexConfig {
@@ -100,6 +105,7 @@ pub struct IndexStats {
     pub residual_bits: u8,
     pub trained: bool,
     pub fde_dimension: usize,
+    pub fde_ann_nodes: usize,
 }
 #[derive(Debug, Error)]
 pub enum IndexError {
@@ -120,6 +126,8 @@ struct State {
     residual_codebook: Vec<f32>,
     documents: HashMap<String, DocumentRecord>,
     postings: Vec<HashSet<String>>,
+    fde_ann: Option<Arc<HNSWIndex>>,
+    fde_ann_ids: Vec<String>,
 }
 pub struct MultiVectorIndex {
     root: PathBuf,
@@ -181,6 +189,8 @@ impl MultiVectorIndex {
                 residual_codebook,
                 documents,
                 postings,
+                fde_ann: None,
+                fde_ann_ids: Vec::new(),
             }),
             root,
             config,
@@ -283,6 +293,8 @@ impl MultiVectorIndex {
             self.validate(&document.vectors)?;
         }
         let mut s = self.state.write().unwrap();
+        s.fde_ann = None;
+        s.fde_ann_ids.clear();
         if s.codebook.is_empty() {
             return Err(IndexError::Invalid(
                 "index is untrained; call train first".into(),
@@ -379,6 +391,70 @@ impl MultiVectorIndex {
         approximate.par_sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
         self.rescore(&s, &normalized, approximate, top_k, candidates)
     }
+    /// Build an HNSW index over persisted FDEs. Exact FDE scan remains available as an oracle.
+    pub fn build_fde_ann(&self, m: usize, ef_construct: usize) -> Result<usize, IndexError> {
+        if m == 0 || ef_construct == 0 {
+            return Err(IndexError::Invalid(
+                "HNSW m and ef_construct must be positive".into(),
+            ));
+        }
+        let s = self.state.read().unwrap();
+        let dimension = self.fde.output_dimension();
+        let mapped = self.fde_store.map()?;
+        let mut ids: Vec<_> = s.documents.keys().cloned().collect();
+        ids.sort();
+        let mut hnsw = HNSWIndex::new(DistanceMetric::Dot, m, ef_construct, 16, dimension);
+        for (point, id) in ids.iter().enumerate() {
+            let vector =
+                FixedVectorStore::get(&mapped, s.documents[id].fde_location, dimension)?.to_vec();
+            hnsw.insert(point as u64, vector)
+                .map_err(|error| IndexError::Invalid(format!("HNSW insert failed: {error}")))?;
+        }
+        drop(s);
+        let mut s = self.state.write().unwrap();
+        s.fde_ann = Some(Arc::new(hnsw));
+        s.fde_ann_ids = ids;
+        Ok(s.fde_ann_ids.len())
+    }
+    pub fn query_with_fde_ann(
+        &self,
+        vectors: &[Vector],
+        top_k: usize,
+        candidates: Option<usize>,
+        ef_search: usize,
+    ) -> Result<Vec<Hit>, IndexError> {
+        self.validate(vectors)?;
+        if top_k == 0 || ef_search == 0 {
+            return Err(IndexError::Invalid(
+                "top_k and ef_search must be positive".into(),
+            ));
+        }
+        let normalized: Vec<_> = vectors.iter().map(|v| normalize(v)).collect();
+        let query_fde = self.fde.encode_query(&normalized);
+        let s = self.state.read().unwrap();
+        let ann = s.fde_ann.as_ref().ok_or_else(|| {
+            IndexError::Invalid("FDE ANN is not built; call /v1/fde/index".into())
+        })?;
+        let count = candidates.unwrap_or(top_k.saturating_mul(8)).max(top_k);
+        let options = SearchRuntimeOptions {
+            ef_search: Some(ef_search.max(count)),
+            ..SearchRuntimeOptions::default()
+        };
+        let points = ann
+            .search_with_options(&query_fde, count, &options)
+            .map_err(|error| IndexError::Invalid(format!("HNSW search failed: {error}")))?;
+        let approximate = points
+            .into_iter()
+            .map(|point| {
+                let id = s
+                    .fde_ann_ids
+                    .get(point.id as usize)
+                    .ok_or_else(|| IndexError::Invalid("invalid HNSW point id".into()))?;
+                Ok((id.clone(), -point.sort_key))
+            })
+            .collect::<Result<Vec<_>, IndexError>>()?;
+        self.rescore(&s, &normalized, approximate, top_k, candidates)
+    }
     pub fn query_with_probes(
         &self,
         vectors: &[Vector],
@@ -473,6 +549,7 @@ impl MultiVectorIndex {
             residual_bits: self.config.residual_bits,
             trained: !s.codebook.is_empty(),
             fde_dimension: self.fde.output_dimension(),
+            fde_ann_nodes: s.fde_ann_ids.len(),
         }
     }
     /// Diagnostic score over caller-provided vectors; used to verify scorer parity.

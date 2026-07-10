@@ -9,6 +9,8 @@ license = "MIT"
 axum = "0.8"
 blake3 = "1.8"
 bytemuck = "1.24"
+# Pinned so a clean checkout builds without a sibling `vectordb` directory.
+vectordb = { git = "https://github.com/rosharma719/vectordb", rev = "31ecd617709387a4d7df8edd9a9a2195ad0bd11b" }
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

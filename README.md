@@ -53,6 +53,18 @@ query buckets store sums, and empty document buckets use the nearest occupied
 SimHash bucket. The centroid path remains available for controlled probe sweeps.
 Current FDE search is exact; ANN and product quantization are the next scaling layers.
 
+An optional HNSW candidate index can be built over the persisted FDE segment:
+
+```bash
+curl -X POST localhost:8080/v1/fde/index \
+  -H 'content-type: application/json' \
+  -d '{"m":16,"ef_construct":256}'
+```
+
+Then select it per query with `"candidate_backend":"hnsw"` and an optional
+`"ef_search"`. Exact MUVERA FDE search remains the default and acts as the
+recall oracle for ANN evaluation.
+
 ## Retrieval-quality benchmark
 
 The [free local benchmark](benchmark/README.md) compares this engine with

@@ -44,6 +44,15 @@ fn late_interaction_persists_and_ranks() {
         .unwrap();
     assert_eq!(hits[0].id, "code");
     assert!(hits[0].score > hits[1].score);
+    index.build_fde_ann(4, 16).unwrap();
+    assert_eq!(index.stats().fde_ann_nodes, 2);
+    assert_eq!(
+        index
+            .query_with_fde_ann(&[vec![1., 0., 0.], vec![0., 1., 0.]], 1, Some(2), 16)
+            .unwrap()[0]
+            .id,
+        "code"
+    );
     drop(index);
     let restored = MultiVectorIndex::open(directory.path(), config).unwrap();
     assert_eq!(
