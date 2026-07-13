@@ -90,6 +90,11 @@ pub struct Hit {
     pub score: f32,
     pub metadata: Value,
 }
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct CandidateHit {
+    pub id: String,
+    pub score: f32,
+}
 #[derive(Clone, Debug)]
 pub struct UpsertDocument {
     pub id: String,
@@ -370,7 +375,12 @@ impl MultiVectorIndex {
             return Err(IndexError::Invalid("top_k must be positive".into()));
         }
         let normalized: Vec<_> = vectors.iter().map(|vector| normalize(vector)).collect();
-        let query_fde = self.fde.encode_query(&normalized);
+        let approximate = self.exact_fde_scores(&normalized)?;
+        let s = self.state.read().unwrap();
+        self.rescore(&s, &normalized, approximate, top_k, candidates)
+    }
+    fn exact_fde_scores(&self, normalized: &[Vector]) -> Result<Vec<(String, f32)>, IndexError> {
+        let query_fde = self.fde.encode_query(normalized);
         let s = self.state.read().unwrap();
         let mapped_fdes = self.fde_store.map()?;
         let fde_dimension = self.fde.output_dimension();
@@ -389,7 +399,27 @@ impl MultiVectorIndex {
             .collect();
         let mut approximate = approximate_results?;
         approximate.par_sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
-        self.rescore(&s, &normalized, approximate, top_k, candidates)
+        Ok(approximate)
+    }
+    /// Return exact FDE candidates before compressed MaxSim reranking.
+    pub fn exact_fde_candidates(
+        &self,
+        vectors: &[Vector],
+        count: usize,
+    ) -> Result<Vec<CandidateHit>, IndexError> {
+        self.validate(vectors)?;
+        if count == 0 {
+            return Err(IndexError::Invalid(
+                "candidate count must be positive".into(),
+            ));
+        }
+        let normalized: Vec<_> = vectors.iter().map(|vector| normalize(vector)).collect();
+        Ok(self
+            .exact_fde_scores(&normalized)?
+            .into_iter()
+            .take(count)
+            .map(|(id, score)| CandidateHit { id, score })
+            .collect())
     }
     /// Build an HNSW index over persisted FDEs. Exact FDE scan remains available as an oracle.
     pub fn build_fde_ann(&self, m: usize, ef_construct: usize) -> Result<usize, IndexError> {
@@ -432,18 +462,28 @@ impl MultiVectorIndex {
         let normalized: Vec<_> = vectors.iter().map(|v| normalize(v)).collect();
         let query_fde = self.fde.encode_query(&normalized);
         let s = self.state.read().unwrap();
+        let count = candidates.unwrap_or(top_k.saturating_mul(8)).max(top_k);
+        let approximate = self.ann_fde_scores(&s, &query_fde, count, ef_search)?;
+        self.rescore(&s, &normalized, approximate, top_k, candidates)
+    }
+    fn ann_fde_scores(
+        &self,
+        s: &State,
+        query_fde: &Vector,
+        count: usize,
+        ef_search: usize,
+    ) -> Result<Vec<(String, f32)>, IndexError> {
         let ann = s.fde_ann.as_ref().ok_or_else(|| {
             IndexError::Invalid("FDE ANN is not built; call /v1/fde/index".into())
         })?;
-        let count = candidates.unwrap_or(top_k.saturating_mul(8)).max(top_k);
         let options = SearchRuntimeOptions {
             ef_search: Some(ef_search.max(count)),
             ..SearchRuntimeOptions::default()
         };
         let points = ann
-            .search_with_options(&query_fde, count, &options)
+            .search_with_options(query_fde, count, &options)
             .map_err(|error| IndexError::Invalid(format!("HNSW search failed: {error}")))?;
-        let approximate = points
+        points
             .into_iter()
             .map(|point| {
                 let id = s
@@ -452,8 +492,29 @@ impl MultiVectorIndex {
                     .ok_or_else(|| IndexError::Invalid("invalid HNSW point id".into()))?;
                 Ok((id.clone(), -point.sort_key))
             })
-            .collect::<Result<Vec<_>, IndexError>>()?;
-        self.rescore(&s, &normalized, approximate, top_k, candidates)
+            .collect::<Result<Vec<_>, IndexError>>()
+    }
+    /// Return HNSW FDE candidates before compressed MaxSim reranking.
+    pub fn ann_fde_candidates(
+        &self,
+        vectors: &[Vector],
+        count: usize,
+        ef_search: usize,
+    ) -> Result<Vec<CandidateHit>, IndexError> {
+        self.validate(vectors)?;
+        if count == 0 || ef_search == 0 {
+            return Err(IndexError::Invalid(
+                "candidate count and ef_search must be positive".into(),
+            ));
+        }
+        let normalized: Vec<_> = vectors.iter().map(|vector| normalize(vector)).collect();
+        let query_fde = self.fde.encode_query(&normalized);
+        let s = self.state.read().unwrap();
+        Ok(self
+            .ann_fde_scores(&s, &query_fde, count, ef_search)?
+            .into_iter()
+            .map(|(id, score)| CandidateHit { id, score })
+            .collect())
     }
     pub fn query_with_probes(
         &self,

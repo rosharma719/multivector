@@ -71,3 +71,20 @@ The [free local benchmark](benchmark/README.md) compares this engine with
 ColBERTv2 against embedded Qdrant with a MiniLM single-vector model on identical
 BEIR documents, queries, and relevance judgments. It reports nDCG@10,
 Recall@10, retrieval latency, and index size without using paid APIs.
+
+## Versioning and reproducibility
+
+`Cargo.toml` is the single source of truth for the engine's Semantic Version.
+Use the checked-in helper before a release, then update `CHANGELOG.md` and tag
+the resulting commit as `v<version>`:
+
+```bash
+python scripts/version.py --check
+python scripts/version.py --bump patch  # or minor / major
+cargo test
+git tag v$(python scripts/version.py --print)
+```
+
+Every benchmark and score-validation command appends a JSON Lines record to
+`benchmark/reports/v<version>.jsonl` by default. Commit that version ledger with
+the change it measures; each record embeds complete runtime provenance.

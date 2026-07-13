@@ -14,6 +14,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 #[derive(Parser)]
+#[command(version)]
 struct Args {
     #[arg(long, default_value = "./data")]
     path: PathBuf,
@@ -57,6 +58,15 @@ struct QueryRequest {
     ef_search: Option<usize>,
 }
 #[derive(Deserialize)]
+struct CandidateRequest {
+    vectors: Vec<Vec<f32>>,
+    count: usize,
+    #[serde(default = "default_candidate_backend")]
+    candidate_backend: String,
+    #[serde(default = "two_fifty_six")]
+    ef_search: usize,
+}
+#[derive(Deserialize)]
 struct TrainRequest {
     vectors: Vec<Vec<f32>>,
     #[serde(default = "twenty")]
@@ -90,6 +100,9 @@ fn sixteen() -> usize {
 fn two_fifty_six() -> usize {
     256
 }
+fn default_candidate_backend() -> String {
+    "muvera".into()
+}
 
 struct ApiError(IndexError);
 impl IntoResponse for ApiError {
@@ -108,7 +121,7 @@ impl From<IndexError> for ApiError {
 }
 
 async fn health() -> Json<Value> {
-    Json(json!({"status":"ok"}))
+    Json(json!({"status":"ok", "version": env!("CARGO_PKG_VERSION")}))
 }
 async fn stats(State(index): State<Arc<MultiVectorIndex>>) -> Json<Value> {
     Json(serde_json::to_value(index.stats()).unwrap())
@@ -186,6 +199,21 @@ async fn build_ann(
         json!({"nodes": index.build_fde_ann(body.m, body.ef_construct)?}),
     ))
 }
+async fn candidates(
+    State(index): State<Arc<MultiVectorIndex>>,
+    Json(body): Json<CandidateRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let candidates = match body.candidate_backend.as_str() {
+        "muvera" => index.exact_fde_candidates(&body.vectors, body.count)?,
+        "hnsw" => index.ann_fde_candidates(&body.vectors, body.count, body.ef_search)?,
+        other => {
+            return Err(ApiError(IndexError::Invalid(format!(
+                "unknown candidate backend: {other}"
+            ))));
+        }
+    };
+    Ok(Json(json!({"candidates": candidates})))
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -205,6 +233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/stats", get(stats))
         .route("/v1/train", post(train))
         .route("/v1/debug/score", post(score))
+        .route("/v1/debug/candidates", post(candidates))
         .route("/v1/fde/index", post(build_ann))
         .route("/v1/vectors/upsert", post(upsert))
         .route("/v1/query", post(query))

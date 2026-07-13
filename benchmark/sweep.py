@@ -1,30 +1,106 @@
 #!/usr/bin/env python3
 """Sweep a completed index without rebuilding or re-encoding documents."""
-import argparse, json, subprocess, time
-from collections import defaultdict
+import argparse
+import json
+import subprocess
+import sys
+import time
 from pathlib import Path
-import ir_datasets, numpy as np
+
+import numpy as np
 from pylate import models
+
+from data import load_slice
+from provenance import write_report
 from run import colbert_encode, http, score
 
+
+def report_for(queries, vectors, qrels, base, backend, candidates, probes, ef_search):
+    run, latency = {}, []
+    for query, vector in zip(queries, vectors):
+        body = {"vectors": vector, "top_k": 100, "candidates": candidates}
+        if backend == "centroid":
+            body["probes"] = probes
+        if backend == "hnsw":
+            body.update({"candidate_backend": "hnsw", "ef_search": ef_search})
+        started = time.perf_counter()
+        result = http(base, "/v1/query", body)
+        latency.append(time.perf_counter() - started)
+        run[query.query_id] = [match["id"] for match in result["matches"]]
+    return {
+        "dataset": None,
+        "queries": len(queries),
+        "backend": backend,
+        "probes": probes if backend == "centroid" else None,
+        "ef_search": ef_search if backend == "hnsw" else None,
+        "candidates": candidates,
+        **score(run, qrels),
+        "p50_ms": float(np.percentile(latency, 50) * 1000),
+        "p95_ms": float(np.percentile(latency, 95) * 1000),
+    }
+
+
 def main():
-    p=argparse.ArgumentParser();p.add_argument("--index",type=Path,default=Path("benchmark/results/nfcorpus/plaid"));p.add_argument("--dataset",default="beir/nfcorpus/test");p.add_argument("--limit-docs",type=int);p.add_argument("--limit-queries",type=int);p.add_argument("--centroids",type=int,default=256);p.add_argument("--configured-probes",type=int,default=8);p.add_argument("--backend",choices=["muvera","centroid","hnsw"],default="muvera");p.add_argument("--probes",type=int,default=8);p.add_argument("--ef-search",type=int,default=256);p.add_argument("--hnsw-m",type=int,default=16);p.add_argument("--candidates",type=int,default=100);p.add_argument("--output",type=Path,required=True);a=p.parse_args()
-    dataset=ir_datasets.load(a.dataset);docs=list(dataset.docs_iter())[:a.limit_docs];doc_ids={d.doc_id for d in docs};queries=list(dataset.queries_iter())[:a.limit_queries];query_ids={q.query_id for q in queries};qrels=defaultdict(dict)
-    for r in dataset.qrels_iter():
-        if r.query_id in query_ids and r.doc_id in doc_ids and r.relevance>0:qrels[r.query_id][r.doc_id]=r.relevance
-    queries=[q for q in queries if q.query_id in qrels];model=models.ColBERT(model_name_or_path="colbert-ir/colbertv2.0");vectors=colbert_encode(model,[q.text for q in queries],True,32)
-    root=Path(__file__).resolve().parents[1];command=["cargo","run","--release","--","--dimension","128","--centroids",str(a.centroids),"--probes",str(a.configured_probes),"--path",str(a.index),"--listen","127.0.0.1:18080"];server=subprocess.Popen(command,cwd=root,stdout=subprocess.DEVNULL);base="http://127.0.0.1:18080"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--index", type=Path, default=Path("benchmark/results/nfcorpus/plaid"))
+    parser.add_argument("--dataset", default="beir/nfcorpus/test")
+    parser.add_argument("--limit-docs", type=int)
+    parser.add_argument("--limit-queries", type=int)
+    parser.add_argument("--sampling", choices=["prefix", "qrels"], default="prefix")
+    parser.add_argument("--sample-seed", type=int, default=13)
+    parser.add_argument("--centroids", type=int, default=256)
+    parser.add_argument("--configured-probes", type=int, default=8)
+    parser.add_argument("--backend", choices=["muvera", "centroid", "hnsw"], default="muvera")
+    parser.add_argument("--probes", type=int, default=8)
+    parser.add_argument("--ef-search", type=int, default=256)
+    parser.add_argument("--ef-search-grid", type=int, nargs="+")
+    parser.add_argument("--hnsw-m", type=int, default=16)
+    parser.add_argument("--candidates", type=int, default=100)
+    parser.add_argument("--candidate-grid", type=int, nargs="+")
+    parser.add_argument("--report-dir", type=Path, default=Path("benchmark/reports"))
+    parser.add_argument("--output", type=Path, help="deprecated; all records append to the version ledger")
+    args = parser.parse_args()
+    if args.output is not None:
+        print("--output is deprecated and ignored; appending to the version ledger", file=sys.stderr)
+
+    _, queries, qrels = load_slice(
+        args.dataset, args.limit_docs, args.limit_queries, args.sampling, args.sample_seed
+    )
+
+    model = models.ColBERT(model_name_or_path="colbert-ir/colbertv2.0")
+    vectors = colbert_encode(model, [query.text for query in queries], True, 32)
+    root = Path(__file__).resolve().parents[1]
+    command = ["cargo", "run", "--release", "--", "--dimension", "128", "--centroids", str(args.centroids), "--probes", str(args.configured_probes), "--path", str(args.index), "--listen", "127.0.0.1:18080"]
+    server = subprocess.Popen(command, cwd=root, stdout=subprocess.DEVNULL)
+    base = "http://127.0.0.1:18080"
+    candidates = args.candidate_grid or [args.candidates]
+    ef_searches = args.ef_search_grid or [args.ef_search]
     try:
         for _ in range(60):
-            try:http(base,"/healthz");break
-            except Exception:time.sleep(1)
-        if a.backend=="hnsw":http(base,"/v1/fde/index",{"m":a.hnsw_m,"ef_construct":a.ef_search})
-        run={};latency=[]
-        for q,v in zip(queries,vectors):
-            body={"vectors":v,"top_k":100,"candidates":a.candidates}
-            if a.backend=="centroid":body["probes"]=a.probes
-            if a.backend=="hnsw":body.update({"candidate_backend":"hnsw","ef_search":a.ef_search})
-            started=time.perf_counter();result=http(base,"/v1/query",body);latency.append(time.perf_counter()-started);run[q.query_id]=[x["id"] for x in result["matches"]]
-    finally:server.terminate();server.wait(timeout=30)
-    report={"dataset":a.dataset,"queries":len(queries),"backend":a.backend,"probes":a.probes if a.backend=="centroid" else None,"ef_search":a.ef_search if a.backend=="hnsw" else None,"candidates":a.candidates,**score(run,qrels),"p50_ms":float(np.percentile(latency,50)*1000),"p95_ms":float(np.percentile(latency,95)*1000)};a.output.parent.mkdir(parents=True,exist_ok=True);a.output.write_text(json.dumps(report,indent=2));print(json.dumps(report,indent=2))
-if __name__=="__main__":main()
+            try:
+                http(base, "/healthz")
+                break
+            except Exception:
+                time.sleep(1)
+        else:
+            raise RuntimeError("server did not start")
+        if args.backend == "hnsw":
+            # Build once: every grid point below reuses this graph.
+            http(base, "/v1/fde/index", {"m": args.hnsw_m, "ef_construct": max(ef_searches)})
+        for candidate_count in candidates:
+            searches = ef_searches if args.backend == "hnsw" else [args.ef_search]
+            for ef_search in searches:
+                report = report_for(queries, vectors, qrels, base, args.backend, candidate_count, args.probes, ef_search)
+                report["dataset"] = args.dataset
+                report["sampling"] = args.sampling
+                report["sample_seed"] = args.sample_seed
+                path = write_report(args.report_dir, "sweep", report)
+                print(path)
+                print(json.dumps(report, indent=2))
+    finally:
+        server.terminate()
+        server.wait(timeout=30)
+
+
+if __name__ == "__main__":
+    main()

@@ -5,5 +5,7 @@ mod fde;
 mod muvera;
 mod storage;
 
-pub use engine::{Hit, IndexConfig, IndexError, IndexStats, MultiVectorIndex, UpsertDocument};
+pub use engine::{
+    CandidateHit, Hit, IndexConfig, IndexError, IndexStats, MultiVectorIndex, UpsertDocument,
+};
 pub use fde::maxsim;

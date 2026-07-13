@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Free local BEIR benchmark: PLAID+ColBERTv2 vs Qdrant+MiniLM."""
 import argparse, json, math, shutil, subprocess, time, urllib.error, urllib.request
-from collections import defaultdict
 from pathlib import Path
-import ir_datasets, numpy as np
+import numpy as np
 from pylate import models
 from qdrant_client import QdrantClient, models as qm
 from sentence_transformers import SentenceTransformer
+from data import load_slice, write_slice_manifest
+from env import load_env
+from provenance import write_report
+
+load_env()
 
 def http(base, route, body=None):
     data=None if body is None else json.dumps(body).encode()
@@ -33,11 +37,8 @@ def colbert_encode(model,texts,is_query,batch):
 def size(path):return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument("--dataset",default="beir/nfcorpus/test");p.add_argument("--output",type=Path,default=Path("benchmark/results/nfcorpus"));p.add_argument("--limit-docs",type=int);p.add_argument("--limit-queries",type=int);p.add_argument("--centroids",type=int,default=256);p.add_argument("--probes",type=int,default=8);p.add_argument("--candidates",type=int,default=100);p.add_argument("--batch-size",type=int,default=32);a=p.parse_args();a.output.mkdir(parents=True,exist_ok=True)
-    dataset=ir_datasets.load(a.dataset);docs=list(dataset.docs_iter())[:a.limit_docs];queries=list(dataset.queries_iter())[:a.limit_queries];doc_ids={d.doc_id for d in docs};query_ids={q.query_id for q in queries};qrels=defaultdict(dict)
-    for r in dataset.qrels_iter():
-        if r.query_id in query_ids and r.doc_id in doc_ids and r.relevance>0:qrels[r.query_id][r.doc_id]=r.relevance
-    queries=[q for q in queries if q.query_id in qrels];texts=[(getattr(d,"title","")+" "+d.text).strip() for d in docs]
+    p=argparse.ArgumentParser();p.add_argument("--dataset",default="beir/nfcorpus/test");p.add_argument("--output",type=Path,default=Path("benchmark/results/nfcorpus"));p.add_argument("--report-dir",type=Path,default=Path("benchmark/reports"));p.add_argument("--limit-docs",type=int);p.add_argument("--limit-queries",type=int);p.add_argument("--sampling",choices=["prefix","qrels"],default="prefix");p.add_argument("--sample-seed",type=int,default=13);p.add_argument("--centroids",type=int,default=256);p.add_argument("--probes",type=int,default=8);p.add_argument("--candidates",type=int,default=100);p.add_argument("--batch-size",type=int,default=32);a=p.parse_args();a.output.mkdir(parents=True,exist_ok=True)
+    docs,queries,qrels=load_slice(a.dataset,a.limit_docs,a.limit_queries,a.sampling,a.sample_seed);write_slice_manifest(a.output/"slice.json",a.dataset,a.sampling,a.sample_seed,docs,queries);texts=[(getattr(d,"title","")+" "+d.text).strip() for d in docs]
 
     print("Encoding documents with free ColBERTv2 checkpoint")
     colbert=models.ColBERT(model_name_or_path="colbert-ir/colbertv2.0");multi_docs=colbert_encode(colbert,texts,False,a.batch_size);dimension=len(multi_docs[0][0]);all_tokens=[token for doc in multi_docs for token in doc]
@@ -64,5 +65,5 @@ def main():
     dense_queries=dense.encode([q.text for q in queries],batch_size=a.batch_size,normalize_embeddings=True);dense_run={};dense_times=[]
     for q,v in zip(queries,dense_queries):
         started=time.perf_counter();hits=client.query_points("docs",query=v.tolist(),limit=100).points;dense_times.append(time.perf_counter()-started);dense_run[q.query_id]=[x.payload["doc_id"] for x in hits]
-    client.close();report={"dataset":a.dataset,"documents":len(docs),"queries":len(queries),"systems":{"muvera_colbertv2":{**score(plaid_run,qrels),"p50_ms":float(np.percentile(plaid_times,50)*1000),"p95_ms":float(np.percentile(plaid_times,95)*1000),"storage_bytes":size(plaid_path),"index_stats":plaid_stats},"qdrant_minilm":{**score(dense_run,qrels),"p50_ms":float(np.percentile(dense_times,50)*1000),"p95_ms":float(np.percentile(dense_times,95)*1000),"storage_bytes":size(qpath)}}};(a.output/"report.json").write_text(json.dumps(report,indent=2));print(json.dumps(report,indent=2))
+    client.close();report={"dataset":a.dataset,"sampling":a.sampling,"sample_seed":a.sample_seed,"documents":len(docs),"queries":len(queries),"systems":{"muvera_colbertv2":{**score(plaid_run,qrels),"p50_ms":float(np.percentile(plaid_times,50)*1000),"p95_ms":float(np.percentile(plaid_times,95)*1000),"storage_bytes":size(plaid_path),"index_stats":plaid_stats},"qdrant_minilm":{**score(dense_run,qrels),"p50_ms":float(np.percentile(dense_times,50)*1000),"p95_ms":float(np.percentile(dense_times,95)*1000),"storage_bytes":size(qpath)}}};path=write_report(a.report_dir,"run",report);print(path);print(json.dumps(report,indent=2))
 if __name__=="__main__":main()

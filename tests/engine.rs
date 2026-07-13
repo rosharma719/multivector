@@ -46,6 +46,23 @@ fn late_interaction_persists_and_ranks() {
     assert!(hits[0].score > hits[1].score);
     index.build_fde_ann(4, 16).unwrap();
     assert_eq!(index.stats().fde_ann_nodes, 2);
+    let exact_candidates = index
+        .exact_fde_candidates(&[vec![1., 0., 0.], vec![0., 1., 0.]], 2)
+        .unwrap();
+    let ann_candidates = index
+        .ann_fde_candidates(&[vec![1., 0., 0.], vec![0., 1., 0.]], 2, 16)
+        .unwrap();
+    assert_eq!(exact_candidates[0].id, "code");
+    assert_eq!(
+        exact_candidates
+            .iter()
+            .map(|candidate| &candidate.id)
+            .collect::<std::collections::HashSet<_>>(),
+        ann_candidates
+            .iter()
+            .map(|candidate| &candidate.id)
+            .collect()
+    );
     assert_eq!(
         index
             .query_with_fde_ann(&[vec![1., 0., 0.], vec![0., 1., 0.]], 1, Some(2), 16)
