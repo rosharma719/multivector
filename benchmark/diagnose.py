@@ -10,6 +10,7 @@ import numpy as np
 from pylate import models
 
 from data import load_slice, slice_fingerprint
+from embeddings import cached_ragged
 from provenance import write_report
 from run import colbert_encode, http, score
 
@@ -31,6 +32,8 @@ def main():
     parser.add_argument("--ef-search", type=int, default=256)
     parser.add_argument("--hnsw-m", type=int, default=16)
     parser.add_argument("--report-dir", type=Path, default=Path("benchmark/reports"))
+    parser.add_argument("--cache-dir", type=Path, default=Path("benchmark/cache"))
+    parser.add_argument("--refresh-cache", action="store_true")
     args = parser.parse_args()
 
     docs, queries, qrels = load_slice(
@@ -45,11 +48,21 @@ def main():
                 "benchmark slice does not match the index; rebuild with the same sampling arguments"
             )
 
-    model = models.ColBERT(model_name_or_path="colbert-ir/colbertv2.0")
-    vectors = colbert_encode(model, [query.text for query in queries], True, 32)
+    query_texts = [query.text for query in queries]
+    vectors, query_cache = cached_ragged(
+        args.cache_dir,
+        "colbert-ir/colbertv2.0",
+        "query",
+        [query.query_id for query in queries],
+        query_texts,
+        lambda: colbert_encode(
+            models.ColBERT(model_name_or_path="colbert-ir/colbertv2.0"), query_texts, True, 32
+        ),
+        args.refresh_cache,
+    )
     root = Path(__file__).resolve().parents[1]
     command = [
-        "cargo", "run", "--release", "--", "--dimension", "128",
+        "cargo", "run", "--release", "--bin", "multivector", "--", "--dimension", "128",
         "--centroids", str(args.centroids), "--probes", "8", "--path",
         str(args.index), "--listen", "127.0.0.1:18080",
     ]
@@ -72,6 +85,7 @@ def main():
         latencies = {name: [] for name in runs}
         overlaps, exact_relevant, ann_relevant = [], [], []
         for query, vector in zip(queries, vectors):
+            vector = np.asarray(vector).tolist()
             request = {"vectors": vector, "count": args.candidates}
             exact = http(base, "/v1/debug/candidates", request)["candidates"]
             ann = http(
@@ -116,6 +130,7 @@ def main():
         "candidates": args.candidates,
         "ef_search": args.ef_search,
         "hnsw_build_seconds": build_seconds,
+        "embedding_cache": {"colbert_queries": query_cache},
         "candidate_recall_vs_exact_fde": float(np.mean(overlaps)),
         "exact_fde_relevant_recall": float(np.mean(exact_relevant)),
         "hnsw_relevant_recall": float(np.mean(ann_relevant)),

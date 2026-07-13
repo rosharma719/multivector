@@ -1,8 +1,8 @@
 # Free BEIR comparison
 
 This benchmark is entirely local and free: BEIR through `ir-datasets`, open
-ColBERTv2 and MiniLM checkpoints, this PLAID server, and Qdrant embedded mode.
-It requires no API keys, hosted databases, or paid datasets.
+ColBERTv2 and MiniLM checkpoints, this PLAID server, and the vectordb HNSW crate.
+It requires no hosted databases or paid datasets. A Hugging Face token is optional.
 
 ```bash
 python -m venv .venv
@@ -67,3 +67,58 @@ python benchmark/diagnose.py \
 The diagnostic appends one record containing exhaustive, exact-FDE, and HNSW
 quality/latency plus candidate recall versus exact FDE. The saved slice manifest
 prevents accidentally evaluating an index against a different document sample.
+
+## Embedding cache
+
+All benchmark commands reuse content-addressed embeddings under
+`benchmark/cache/`. ColBERT token embeddings are stored as a contiguous float32
+matrix plus per-item offsets; MiniLM embeddings are stored as a fixed float32
+matrix. Cache keys include IDs and exact text content, model/checkpoint revision,
+query/document mode, normalization, and encoder package versions.
+
+Use a different location with `--cache-dir`, or intentionally regenerate a
+matching entry with `--refresh-cache`. Cached embeddings and large indexes are
+git-ignored; reports record the cache key, checkpoint revision, and hit/miss
+state but never embed the vectors themselves.
+
+Warm all four caches without rebuilding either retrieval index:
+
+```bash
+python benchmark/cache_embeddings.py \
+  --dataset beir/fiqa/test --limit-docs 10000 --limit-queries 100 \
+  --sampling qrels
+```
+
+Compare uncompressed and PLAID-compressed MaxSim over the identical exact-FDE
+candidate sets:
+
+```bash
+python benchmark/uncompressed_oracle.py \
+  --index benchmark/results/fiqa-qrels-10k/plaid \
+  --dataset beir/fiqa/test --limit-docs 10000 --limit-queries 100 \
+  --sampling qrels --candidates 250 --scope candidates
+```
+
+Use `--scope exhaustive` for the uncompressed encoder ceiling, or `--scope both`
+for both tests. Exhaustive mode performs substantially more matrix multiplication;
+candidate mode is the fast test that isolates compression from candidate pruning.
+
+Audit the trained projection and ColBERT query/document conventions after model
+or dependency changes:
+
+```bash
+python benchmark/audit_encoder.py
+```
+
+The command fails if the loaded 128-dimensional projection differs from the
+checkpoint or if marker tokens, mask expansion, punctuation filtering, maximum
+lengths, or output normalization no longer match the expected ColBERTv2 path.
+
+Benchmark cached MiniLM embeddings with exact search and the vectordb HNSW
+implementation, without rebuilding the multi-vector index:
+
+```bash
+python benchmark/dense_baseline.py \
+  --dataset beir/fiqa/test --limit-docs 10000 --limit-queries 100 \
+  --sampling qrels --m 16 --ef-search 256
+```

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Free local BEIR benchmark: PLAID+ColBERTv2 vs Qdrant+MiniLM."""
+"""Free local BEIR benchmark: PLAID+ColBERTv2 vs exact/vectordb MiniLM."""
 import argparse, json, math, shutil, subprocess, time, urllib.error, urllib.request
 from pathlib import Path
 import numpy as np
 from pylate import models
-from qdrant_client import QdrantClient, models as qm
 from sentence_transformers import SentenceTransformer
 from data import load_slice, write_slice_manifest
+from embeddings import cached_fixed, cached_ragged
 from env import load_env
 from provenance import write_report
 
@@ -37,14 +37,19 @@ def colbert_encode(model,texts,is_query,batch):
 def size(path):return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument("--dataset",default="beir/nfcorpus/test");p.add_argument("--output",type=Path,default=Path("benchmark/results/nfcorpus"));p.add_argument("--report-dir",type=Path,default=Path("benchmark/reports"));p.add_argument("--limit-docs",type=int);p.add_argument("--limit-queries",type=int);p.add_argument("--sampling",choices=["prefix","qrels"],default="prefix");p.add_argument("--sample-seed",type=int,default=13);p.add_argument("--centroids",type=int,default=256);p.add_argument("--probes",type=int,default=8);p.add_argument("--candidates",type=int,default=100);p.add_argument("--batch-size",type=int,default=32);a=p.parse_args();a.output.mkdir(parents=True,exist_ok=True)
+    p=argparse.ArgumentParser();p.add_argument("--dataset",default="beir/nfcorpus/test");p.add_argument("--output",type=Path,default=Path("benchmark/results/nfcorpus"));p.add_argument("--report-dir",type=Path,default=Path("benchmark/reports"));p.add_argument("--cache-dir",type=Path,default=Path("benchmark/cache"));p.add_argument("--refresh-cache",action="store_true");p.add_argument("--limit-docs",type=int);p.add_argument("--limit-queries",type=int);p.add_argument("--sampling",choices=["prefix","qrels"],default="prefix");p.add_argument("--sample-seed",type=int,default=13);p.add_argument("--centroids",type=int,default=256);p.add_argument("--probes",type=int,default=8);p.add_argument("--candidates",type=int,default=100);p.add_argument("--dense-hnsw-m",type=int,default=16);p.add_argument("--dense-ef-search",type=int,default=256);p.add_argument("--batch-size",type=int,default=32);a=p.parse_args();a.output.mkdir(parents=True,exist_ok=True)
     docs,queries,qrels=load_slice(a.dataset,a.limit_docs,a.limit_queries,a.sampling,a.sample_seed);write_slice_manifest(a.output/"slice.json",a.dataset,a.sampling,a.sample_seed,docs,queries);texts=[(getattr(d,"title","")+" "+d.text).strip() for d in docs]
 
-    print("Encoding documents with free ColBERTv2 checkpoint")
-    colbert=models.ColBERT(model_name_or_path="colbert-ir/colbertv2.0");multi_docs=colbert_encode(colbert,texts,False,a.batch_size);dimension=len(multi_docs[0][0]);all_tokens=[token for doc in multi_docs for token in doc]
-    rng=np.random.default_rng(13);n=min(len(all_tokens),max(a.centroids*50,a.centroids));samples=[all_tokens[i] for i in rng.choice(len(all_tokens),n,replace=False)]
+    colbert=None
+    def encode_colbert(values,is_query):
+        nonlocal colbert
+        if colbert is None: colbert=models.ColBERT(model_name_or_path="colbert-ir/colbertv2.0")
+        return colbert_encode(colbert,values,is_query,a.batch_size)
+    print("Loading or encoding ColBERTv2 documents")
+    multi_docs,colbert_doc_cache=cached_ragged(a.cache_dir,"colbert-ir/colbertv2.0","document",[d.doc_id for d in docs],texts,lambda:encode_colbert(texts,False),a.refresh_cache);dimension=multi_docs[0].shape[1]
+    lengths=np.asarray([len(document) for document in multi_docs],dtype=np.int64);offsets=np.concatenate(([0],np.cumsum(lengths)));rng=np.random.default_rng(13);n=min(int(offsets[-1]),max(a.centroids*50,a.centroids));chosen=rng.choice(int(offsets[-1]),n,replace=False);document_indices=np.searchsorted(offsets[1:],chosen,side="right");samples=[np.asarray(multi_docs[document][token-offsets[document]],dtype=np.float32).tolist() for document,token in zip(document_indices,chosen)]
     plaid_path=a.output/"plaid";shutil.rmtree(plaid_path,ignore_errors=True);root=Path(__file__).resolve().parents[1]
-    command=["cargo","run","--release","--","--dimension",str(dimension),"--centroids",str(a.centroids),"--probes",str(a.probes),"--path",str(plaid_path),"--listen","127.0.0.1:18080"]
+    command=["cargo","run","--release","--bin","multivector","--","--dimension",str(dimension),"--centroids",str(a.centroids),"--probes",str(a.probes),"--path",str(plaid_path),"--listen","127.0.0.1:18080"]
     server=subprocess.Popen(command,cwd=root,stdout=subprocess.DEVNULL);base="http://127.0.0.1:18080"
     try:
         for _ in range(300):
@@ -52,18 +57,32 @@ def main():
             except Exception:time.sleep(1)
         else:raise RuntimeError("PLAID server did not start")
         http(base,"/v1/train",{"vectors":samples,"iterations":20})
-        for start in range(0,len(docs),100):http(base,"/v1/vectors/upsert",{"documents":[{"id":d.doc_id,"vectors":v} for d,v in zip(docs[start:start+100],multi_docs[start:start+100])]})
-        multi_queries=colbert_encode(colbert,[q.text for q in queries],True,a.batch_size);plaid_run={};plaid_times=[]
+        for start in range(0,len(docs),100):http(base,"/v1/vectors/upsert",{"documents":[{"id":d.doc_id,"vectors":np.asarray(v).tolist()} for d,v in zip(docs[start:start+100],multi_docs[start:start+100])]})
+        query_texts=[q.text for q in queries];multi_queries,colbert_query_cache=cached_ragged(a.cache_dir,"colbert-ir/colbertv2.0","query",[q.query_id for q in queries],query_texts,lambda:encode_colbert(query_texts,True),a.refresh_cache);plaid_run={};plaid_times=[]
         for q,v in zip(queries,multi_queries):
-            started=time.perf_counter();result=http(base,"/v1/query",{"vectors":v,"top_k":100,"candidates":a.candidates});plaid_times.append(time.perf_counter()-started);plaid_run[q.query_id]=[x["id"] for x in result["matches"]]
+            started=time.perf_counter();result=http(base,"/v1/query",{"vectors":np.asarray(v).tolist(),"top_k":100,"candidates":a.candidates});plaid_times.append(time.perf_counter()-started);plaid_run[q.query_id]=[x["id"] for x in result["matches"]]
         plaid_stats=http(base,"/v1/stats")
     finally:server.terminate();server.wait(timeout=30)
 
-    print("Encoding documents with free MiniLM checkpoint and indexing embedded Qdrant")
-    dense=SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2");dense_docs=dense.encode(texts,batch_size=a.batch_size,normalize_embeddings=True,show_progress_bar=True);qpath=a.output/"qdrant";shutil.rmtree(qpath,ignore_errors=True);client=QdrantClient(path=str(qpath));client.create_collection("docs",vectors_config=qm.VectorParams(size=dense_docs.shape[1],distance=qm.Distance.COSINE))
-    for start in range(0,len(docs),256):client.upsert("docs",[qm.PointStruct(id=i,vector=dense_docs[i].tolist(),payload={"doc_id":docs[i].doc_id}) for i in range(start,min(start+256,len(docs)))])
-    dense_queries=dense.encode([q.text for q in queries],batch_size=a.batch_size,normalize_embeddings=True);dense_run={};dense_times=[]
-    for q,v in zip(queries,dense_queries):
-        started=time.perf_counter();hits=client.query_points("docs",query=v.tolist(),limit=100).points;dense_times.append(time.perf_counter()-started);dense_run[q.query_id]=[x.payload["doc_id"] for x in hits]
-    client.close();report={"dataset":a.dataset,"sampling":a.sampling,"sample_seed":a.sample_seed,"documents":len(docs),"queries":len(queries),"systems":{"muvera_colbertv2":{**score(plaid_run,qrels),"p50_ms":float(np.percentile(plaid_times,50)*1000),"p95_ms":float(np.percentile(plaid_times,95)*1000),"storage_bytes":size(plaid_path),"index_stats":plaid_stats},"qdrant_minilm":{**score(dense_run,qrels),"p50_ms":float(np.percentile(dense_times,50)*1000),"p95_ms":float(np.percentile(dense_times,95)*1000),"storage_bytes":size(qpath)}}};path=write_report(a.report_dir,"run",report);print(path);print(json.dumps(report,indent=2))
+    dense=None
+    def encode_dense(values):
+        nonlocal dense
+        if dense is None: dense=SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+        return dense.encode(values,batch_size=a.batch_size,normalize_embeddings=True,show_progress_bar=True)
+    print("Loading or encoding MiniLM documents and indexing vectordb")
+    dense_docs,minilm_doc_cache=cached_fixed(a.cache_dir,"sentence-transformers/all-MiniLM-L6-v2","document",[d.doc_id for d in docs],texts,lambda:encode_dense(texts),True,a.refresh_cache);dense_path=a.output/"vectordb";shutil.rmtree(dense_path,ignore_errors=True);dense_server=subprocess.Popen(["cargo","run","--release","--bin","dense_server","--","--dimension",str(dense_docs.shape[1]),"--path",str(dense_path),"--listen","127.0.0.1:18081"],cwd=root,stdout=subprocess.DEVNULL);dense_base="http://127.0.0.1:18081"
+    try:
+        for _ in range(60):
+            try:http(dense_base,"/healthz");break
+            except Exception:time.sleep(1)
+        else:raise RuntimeError("dense baseline server did not start")
+        for start in range(0,len(docs),256):http(dense_base,"/v1/vectors/upsert",{"documents":[{"id":docs[i].doc_id,"vector":dense_docs[i].tolist()} for i in range(start,min(start+256,len(docs)))]})
+        build_started=time.perf_counter();http(dense_base,"/v1/index",{"m":a.dense_hnsw_m,"ef_construct":a.dense_ef_search});dense_build_seconds=time.perf_counter()-build_started
+        query_texts=[q.text for q in queries];dense_queries,minilm_query_cache=cached_fixed(a.cache_dir,"sentence-transformers/all-MiniLM-L6-v2","query",[q.query_id for q in queries],query_texts,lambda:encode_dense(query_texts),True,a.refresh_cache);exact_dense_run={};vectordb_run={};exact_dense_times=[];vectordb_times=[]
+        for q,v in zip(queries,dense_queries):
+            started=time.perf_counter();result=http(dense_base,"/v1/query",{"vector":v.tolist(),"top_k":100,"backend":"exact"});exact_dense_times.append(time.perf_counter()-started);exact_dense_run[q.query_id]=[x["id"] for x in result["matches"]]
+            started=time.perf_counter();result=http(dense_base,"/v1/query",{"vector":v.tolist(),"top_k":100,"backend":"hnsw","ef_search":a.dense_ef_search});vectordb_times.append(time.perf_counter()-started);vectordb_run[q.query_id]=[x["id"] for x in result["matches"]]
+        dense_stats=http(dense_base,"/v1/stats")
+    finally:dense_server.terminate();dense_server.wait(timeout=30)
+    report={"dataset":a.dataset,"sampling":a.sampling,"sample_seed":a.sample_seed,"documents":len(docs),"queries":len(queries),"embedding_cache":{"colbert_documents":colbert_doc_cache,"colbert_queries":colbert_query_cache,"minilm_documents":minilm_doc_cache,"minilm_queries":minilm_query_cache},"systems":{"muvera_colbertv2":{**score(plaid_run,qrels),"p50_ms":float(np.percentile(plaid_times,50)*1000),"p95_ms":float(np.percentile(plaid_times,95)*1000),"storage_bytes":size(plaid_path),"index_stats":plaid_stats},"exact_minilm":{**score(exact_dense_run,qrels),"p50_ms":float(np.percentile(exact_dense_times,50)*1000),"p95_ms":float(np.percentile(exact_dense_times,95)*1000),"storage_bytes":int(dense_docs.nbytes)},"vectordb_hnsw_minilm":{**score(vectordb_run,qrels),"p50_ms":float(np.percentile(vectordb_times,50)*1000),"p95_ms":float(np.percentile(vectordb_times,95)*1000),"storage_bytes":size(dense_path),"build_seconds":dense_build_seconds,"index_stats":dense_stats,"m":a.dense_hnsw_m,"ef_search":a.dense_ef_search}}};path=write_report(a.report_dir,"run",report);print(path);print(json.dumps(report,indent=2))
 if __name__=="__main__":main()

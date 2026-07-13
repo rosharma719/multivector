@@ -11,6 +11,7 @@ import numpy as np
 from pylate import models
 
 from data import load_slice
+from embeddings import cached_ragged
 from provenance import write_report
 from run import colbert_encode, http, score
 
@@ -18,7 +19,7 @@ from run import colbert_encode, http, score
 def report_for(queries, vectors, qrels, base, backend, candidates, probes, ef_search):
     run, latency = {}, []
     for query, vector in zip(queries, vectors):
-        body = {"vectors": vector, "top_k": 100, "candidates": candidates}
+        body = {"vectors": np.asarray(vector).tolist(), "top_k": 100, "candidates": candidates}
         if backend == "centroid":
             body["probes"] = probes
         if backend == "hnsw":
@@ -58,6 +59,8 @@ def main():
     parser.add_argument("--candidates", type=int, default=100)
     parser.add_argument("--candidate-grid", type=int, nargs="+")
     parser.add_argument("--report-dir", type=Path, default=Path("benchmark/reports"))
+    parser.add_argument("--cache-dir", type=Path, default=Path("benchmark/cache"))
+    parser.add_argument("--refresh-cache", action="store_true")
     parser.add_argument("--output", type=Path, help="deprecated; all records append to the version ledger")
     args = parser.parse_args()
     if args.output is not None:
@@ -67,10 +70,20 @@ def main():
         args.dataset, args.limit_docs, args.limit_queries, args.sampling, args.sample_seed
     )
 
-    model = models.ColBERT(model_name_or_path="colbert-ir/colbertv2.0")
-    vectors = colbert_encode(model, [query.text for query in queries], True, 32)
+    query_texts = [query.text for query in queries]
+    vectors, query_cache = cached_ragged(
+        args.cache_dir,
+        "colbert-ir/colbertv2.0",
+        "query",
+        [query.query_id for query in queries],
+        query_texts,
+        lambda: colbert_encode(
+            models.ColBERT(model_name_or_path="colbert-ir/colbertv2.0"), query_texts, True, 32
+        ),
+        args.refresh_cache,
+    )
     root = Path(__file__).resolve().parents[1]
-    command = ["cargo", "run", "--release", "--", "--dimension", "128", "--centroids", str(args.centroids), "--probes", str(args.configured_probes), "--path", str(args.index), "--listen", "127.0.0.1:18080"]
+    command = ["cargo", "run", "--release", "--bin", "multivector", "--", "--dimension", "128", "--centroids", str(args.centroids), "--probes", str(args.configured_probes), "--path", str(args.index), "--listen", "127.0.0.1:18080"]
     server = subprocess.Popen(command, cwd=root, stdout=subprocess.DEVNULL)
     base = "http://127.0.0.1:18080"
     candidates = args.candidate_grid or [args.candidates]
@@ -94,6 +107,7 @@ def main():
                 report["dataset"] = args.dataset
                 report["sampling"] = args.sampling
                 report["sample_seed"] = args.sample_seed
+                report["embedding_cache"] = {"colbert_queries": query_cache}
                 path = write_report(args.report_dir, "sweep", report)
                 print(path)
                 print(json.dumps(report, indent=2))

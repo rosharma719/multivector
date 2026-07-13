@@ -1,6 +1,7 @@
 [package]
 name = "multivector"
 version = "0.1.0"
+default-run = "multivector"
 edition = "2024"
 description = "Late-interaction retrieval with fixed-dimensional candidate generation and compressed MaxSim rescoring"
 license = "MIT"

@@ -68,9 +68,9 @@ recall oracle for ANN evaluation.
 ## Retrieval-quality benchmark
 
 The [free local benchmark](benchmark/README.md) compares this engine with
-ColBERTv2 against embedded Qdrant with a MiniLM single-vector model on identical
-BEIR documents, queries, and relevance judgments. It reports nDCG@10,
-Recall@10, retrieval latency, and index size without using paid APIs.
+ColBERTv2 against both exact MiniLM search and the vectordb HNSW implementation
+on identical BEIR documents, queries, and relevance judgments. It reports
+nDCG@10, Recall@10, retrieval latency, and index size without using paid APIs.
 
 ## Versioning and reproducibility
 

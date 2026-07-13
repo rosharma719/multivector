@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-PACKAGES = ("ir-datasets", "numpy", "pylate", "qdrant-client", "sentence-transformers")
+PACKAGES = ("ir-datasets", "numpy", "pylate", "sentence-transformers")
 
 
 def command(*args: str) -> str | None:

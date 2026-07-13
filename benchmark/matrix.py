@@ -16,11 +16,15 @@ def main() -> None:
     parser.add_argument("--sample-seed", type=int, default=13)
     parser.add_argument("--centroids", type=int, default=256)
     parser.add_argument("--report-dir", type=Path, default=Path("benchmark/reports"))
+    parser.add_argument("--cache-dir", type=Path, default=Path("benchmark/cache"))
+    parser.add_argument("--refresh-cache", action="store_true")
     parser.add_argument("--candidates", type=int, nargs="+", default=[50, 100, 250, 500])
     parser.add_argument("--ef-search", type=int, nargs="+", default=[32, 64, 128, 256])
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
-    common = ["--index", str(args.index), "--dataset", args.dataset, "--sampling", args.sampling, "--sample-seed", str(args.sample_seed), "--centroids", str(args.centroids), "--candidate-grid", *map(str, args.candidates), "--report-dir", str(args.report_dir)]
+    common = ["--index", str(args.index), "--dataset", args.dataset, "--sampling", args.sampling, "--sample-seed", str(args.sample_seed), "--centroids", str(args.centroids), "--candidate-grid", *map(str, args.candidates), "--report-dir", str(args.report_dir), "--cache-dir", str(args.cache_dir)]
+    if args.refresh_cache:
+        common.append("--refresh-cache")
     if args.limit_docs is not None:
         common += ["--limit-docs", str(args.limit_docs)]
     if args.limit_queries is not None:
