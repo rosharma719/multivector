@@ -7,8 +7,7 @@ import time
 from pathlib import Path
 
 import numpy as np
-from pylate import models
-
+from colbert_config import MODEL_ID, cache_config, load as load_colbert
 from data import load_slice, slice_fingerprint
 from embeddings import cached_ragged
 from provenance import write_report
@@ -51,14 +50,15 @@ def main():
     query_texts = [query.text for query in queries]
     vectors, query_cache = cached_ragged(
         args.cache_dir,
-        "colbert-ir/colbertv2.0",
+        MODEL_ID,
         "query",
         [query.query_id for query in queries],
         query_texts,
         lambda: colbert_encode(
-            models.ColBERT(model_name_or_path="colbert-ir/colbertv2.0"), query_texts, True, 32
+            load_colbert(), query_texts, True, 32
         ),
         args.refresh_cache,
+        cache_config("query"),
     )
     root = Path(__file__).resolve().parents[1]
     command = [

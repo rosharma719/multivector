@@ -7,12 +7,12 @@ import time
 from pathlib import Path
 
 import numpy as np
-from pylate import models
-
+from colbert_config import MODEL_ID, cache_config, load as load_colbert
 from data import load_slice, slice_fingerprint
 from embeddings import cached_ragged
 from provenance import write_report
 from run import colbert_encode, http, score
+from significance import paired_bootstrap
 
 
 def normalize_rows(values):
@@ -87,16 +87,16 @@ def main():
     def encode(texts, is_query):
         nonlocal model
         if model is None:
-            model = models.ColBERT(model_name_or_path="colbert-ir/colbertv2.0")
+            model = load_colbert()
         return colbert_encode(model, texts, is_query, args.batch_size)
 
     document_vectors, document_cache = cached_ragged(
-        args.cache_dir, "colbert-ir/colbertv2.0", "document", doc_ids, doc_texts,
-        lambda: encode(doc_texts, False), args.refresh_cache,
+        args.cache_dir, MODEL_ID, "document", doc_ids, doc_texts,
+        lambda: encode(doc_texts, False), args.refresh_cache, cache_config("document"),
     )
     query_vectors, query_cache = cached_ragged(
-        args.cache_dir, "colbert-ir/colbertv2.0", "query", query_ids, query_texts,
-        lambda: encode(query_texts, True), args.refresh_cache,
+        args.cache_dir, MODEL_ID, "query", query_ids, query_texts,
+        lambda: encode(query_texts, True), args.refresh_cache, cache_config("query"),
     )
     doc_index = {doc_id: index for index, doc_id in enumerate(doc_ids)}
 
@@ -171,6 +171,15 @@ def main():
             **latency_report(exhaustive_times),
             "latency_scope": "maxsim_only",
         }
+    comparisons = {}
+    if uncompressed_candidate_run:
+        comparisons["uncompressed_vs_compressed_same_candidates"] = paired_bootstrap(
+            compressed_run, uncompressed_candidate_run, qrels, seed=args.sample_seed
+        )
+    if exhaustive_run and uncompressed_candidate_run:
+        comparisons["exhaustive_vs_same_candidates"] = paired_bootstrap(
+            uncompressed_candidate_run, exhaustive_run, qrels, seed=args.sample_seed
+        )
     report = {
         "dataset": args.dataset,
         "sampling": args.sampling,
@@ -184,6 +193,7 @@ def main():
             "colbert_queries": query_cache,
         },
         "systems": systems,
+        "comparisons": comparisons,
     }
     path = write_report(args.report_dir, "uncompressed-oracle", report)
     print(path)

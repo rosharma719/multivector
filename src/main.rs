@@ -53,6 +53,7 @@ struct QueryRequest {
     #[serde(default = "ten")]
     top_k: usize,
     candidates: Option<usize>,
+    rerank_candidates: Option<usize>,
     probes: Option<usize>,
     candidate_backend: Option<String>,
     ef_search: Option<usize>,
@@ -154,11 +155,22 @@ async fn query(
             body.candidates,
             body.ef_search.unwrap_or(256),
         )?,
-        Some("muvera") | None => match body.probes {
-            Some(probes) => {
+        Some("muvera") | None => match (body.probes, body.rerank_candidates) {
+            (None, Some(rerank_candidates)) => index.query_with_centroid_pruning(
+                &body.vectors,
+                body.top_k,
+                body.candidates.unwrap_or(rerank_candidates),
+                rerank_candidates,
+            )?,
+            (Some(probes), None) => {
                 index.query_with_probes(&body.vectors, body.top_k, body.candidates, probes)?
             }
-            None => index.query(&body.vectors, body.top_k, body.candidates)?,
+            (None, None) => index.query(&body.vectors, body.top_k, body.candidates)?,
+            (Some(_), Some(_)) => {
+                return Err(ApiError(IndexError::Invalid(
+                    "rerank_candidates cannot be combined with probes".into(),
+                )));
+            }
         },
         Some(other) => {
             return Err(ApiError(IndexError::Invalid(format!(

@@ -74,7 +74,9 @@ All benchmark commands reuse content-addressed embeddings under
 `benchmark/cache/`. ColBERT token embeddings are stored as a contiguous float32
 matrix plus per-item offsets; MiniLM embeddings are stored as a fixed float32
 matrix. Cache keys include IDs and exact text content, model/checkpoint revision,
-query/document mode, normalization, and encoder package versions.
+query/document mode, normalization, encoder package versions, and the complete
+ColBERT tokenization configuration. The BEIR path uses 32-token expanded queries
+and a 300-token document maximum.
 
 Use a different location with `--cache-dir`, or intentionally regenerate a
 matching entry with `--refresh-cache`. Cached embeddings and large indexes are
@@ -113,6 +115,8 @@ python benchmark/audit_encoder.py
 The command fails if the loaded 128-dimensional projection differs from the
 checkpoint or if marker tokens, mask expansion, punctuation filtering, maximum
 lengths, or output normalization no longer match the expected ColBERTv2 path.
+Full comparison and oracle reports also include deterministic paired-bootstrap
+confidence intervals and two-sided p-values for nDCG@10 deltas.
 
 Benchmark cached MiniLM embeddings with exact search and the vectordb HNSW
 implementation, without rebuilding the multi-vector index:
@@ -122,3 +126,61 @@ python benchmark/dense_baseline.py \
   --dataset beir/fiqa/test --limit-docs 10000 --limit-queries 100 \
   --sampling qrels --m 16 --ef-search 256
 ```
+
+## Validated SciFact finding
+
+The original 180-token document configuration produced an uncompressed
+ColBERTv2 ceiling of 0.6464 nDCG@10 and led to the incorrect inference that the
+remaining recall deficit was model behavior. With the BEIR document maximum set
+to 300, the full 300-query SciFact test produces:
+
+| system | nDCG@10 | recall@10 |
+| --- | ---: | ---: |
+| exact MiniLM | 0.6451 | 0.7833 |
+| MUVERA + compressed PLAID, c=500 | 0.6806 | 0.7762 |
+| uncompressed ColBERT, same candidates | 0.6844 | 0.7696 |
+| uncompressed ColBERT, exhaustive | 0.6917 | 0.7946 |
+
+The compressed pipeline's +0.0355 nDCG delta over exact MiniLM has a paired
+bootstrap 95% interval of [+0.0019, +0.0698] and a two-sided p-value of 0.0356.
+This supports the narrower conclusion that the pipeline preserves SciFact's
+late-interaction advantage; it is not evidence that late interaction wins on
+every corpus.
+
+The corrected exhaustive recall also retracts the earlier model-behavior
+explanation. Candidate pruning introduces the observed recall deficit. The
+cached candidate sweep measures the following frontier:
+
+| candidates | corpus fraction | nDCG@10 | recall@10 | p50 ms | p95 ms |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 500 | 9.6% | 0.6806 | 0.7762 | 51.6 | 60.3 |
+| 1,000 | 19.3% | 0.6823 | 0.7812 | 97.0 | 108.2 |
+| 2,000 | 38.6% | 0.6858 | 0.7946 | 188.5 | 207.7 |
+
+There is therefore no corpus-independent production candidate default yet:
+500 is the SciFact latency-oriented point, while 2,000 recovers exhaustive
+recall at roughly 3.7 times the median latency. The append-only report ledger is
+the source of truth for the full records and encoder/cache provenance.
+
+PLAID centroid-interaction pruning is available by passing a broad `candidates`
+count and a smaller `rerank_candidates` count. The 2,000 → 500 pruning frontier
+depends strongly on codebook size:
+
+| codebook | direct-500 nDCG | 2,000→500 nDCG | 2,000→500 p50 | direct-2,000 nDCG |
+| ---: | ---: | ---: | ---: | ---: |
+| 256 | 0.6806 | 0.6694 | 61.3 ms | 0.6858 |
+| 512 | 0.6711 | 0.6732 | 57.3 ms | 0.6776 |
+| 1,024 | 0.6806 | 0.6870 | 58.1 ms | 0.6880 |
+
+At 256 centroids, 4:1 pruning drops below direct-500 — centroid-only ranking is
+not faithful enough to keep the right survivors. At 1,024 centroids, 2,000→500
+reaches within 0.001 nDCG of direct-2,000 (0.6870 vs 0.6880) at about a third of
+its latency (58 ms vs 196 ms), and its recall@10 of 0.7896 exceeds every
+direct-500 configuration. This confirms the Codex log's hypothesis: centroid
+resolution, not the pruning mechanism, was the ceiling. 2:1 pruning (2,000 →
+1,000) is essentially free at any codebook size — its top-10 matches direct-
+2,000 exactly at c=512 and c=1,024.
+
+Direct-500 nDCG@10 is roughly flat across codebook sizes (0.6711–0.6806) within
+paired-bootstrap noise, so larger codebooks pay for themselves through pruning
+headroom rather than through the direct path.

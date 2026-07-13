@@ -44,6 +44,13 @@ fn late_interaction_persists_and_ranks() {
         .unwrap();
     assert_eq!(hits[0].id, "code");
     assert!(hits[0].score > hits[1].score);
+    assert_eq!(
+        index
+            .query_with_centroid_pruning(&[vec![1., 0., 0.], vec![0., 1., 0.]], 1, 2, 1,)
+            .unwrap()[0]
+            .id,
+        "code"
+    );
     index.build_fde_ann(4, 16).unwrap();
     assert_eq!(index.stats().fde_ann_nodes, 2);
     let exact_candidates = index

@@ -6,12 +6,12 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from pylate import models
 from safetensors import safe_open
 from transformers.utils import cached_file
 
 from env import load_env
 from provenance import write_report
+from colbert_config import DOCUMENT_LENGTH, load as load_colbert
 
 load_env()
 
@@ -22,7 +22,7 @@ def main():
     parser.add_argument("--report-dir", type=Path, default=Path("benchmark/reports"))
     args = parser.parse_args()
 
-    model = models.ColBERT(model_name_or_path=args.model)
+    model = load_colbert(args.model)
     checkpoint_path = cached_file(args.model, "model.safetensors")
     with safe_open(checkpoint_path, framework="pt", device="cpu") as checkpoint:
         checkpoint_projection = checkpoint.get_tensor("linear.weight")
@@ -57,7 +57,7 @@ def main():
         "query_prefix_inserted": query_tokens[1] == "[unused0]",
         "document_prefix_inserted": document_tokens[1] == "[unused1]",
         "query_length_32": model.query_length == 32 and len(query_tokens) == 32,
-        "document_length_180": model.document_length == 180,
+        "document_length_300": model.document_length == DOCUMENT_LENGTH,
         "query_mask_expansion": model.do_query_expansion
         and query_tokens.count("[MASK]") > 0,
         "expansion_attention_disabled": not model.attend_to_expansion_tokens,

@@ -4,9 +4,9 @@ import argparse
 import json
 from pathlib import Path
 
-from pylate import models
 from sentence_transformers import SentenceTransformer
 
+from colbert_config import MODEL_ID, cache_config, load as load_colbert
 from data import load_slice
 from embeddings import cached_fixed, cached_ragged
 from env import load_env
@@ -40,16 +40,16 @@ def main():
     def encode_colbert(texts, is_query):
         nonlocal colbert
         if colbert is None:
-            colbert = models.ColBERT(model_name_or_path="colbert-ir/colbertv2.0")
+            colbert = load_colbert()
         return colbert_encode(colbert, texts, is_query, args.batch_size)
 
     _, colbert_docs = cached_ragged(
-        args.cache_dir, "colbert-ir/colbertv2.0", "document", doc_ids, doc_texts,
-        lambda: encode_colbert(doc_texts, False), args.refresh_cache,
+        args.cache_dir, MODEL_ID, "document", doc_ids, doc_texts,
+        lambda: encode_colbert(doc_texts, False), args.refresh_cache, cache_config("document"),
     )
     _, colbert_queries = cached_ragged(
-        args.cache_dir, "colbert-ir/colbertv2.0", "query", query_ids, query_texts,
-        lambda: encode_colbert(query_texts, True), args.refresh_cache,
+        args.cache_dir, MODEL_ID, "query", query_ids, query_texts,
+        lambda: encode_colbert(query_texts, True), args.refresh_cache, cache_config("query"),
     )
 
     minilm = None

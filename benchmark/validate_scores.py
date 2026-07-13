@@ -3,7 +3,8 @@
 import argparse, json, subprocess, time
 from pathlib import Path
 import ir_datasets, numpy as np
-from pylate import models, rank
+from pylate import rank
+from colbert_config import MODEL_ID, cache_config, load as load_colbert
 from env import load_env
 from embeddings import cached_ragged
 from run import colbert_encode, http
@@ -25,9 +26,9 @@ def main():
     model=None
     def encode(values,is_query):
         nonlocal model
-        if model is None:model=models.ColBERT(model_name_or_path="colbert-ir/colbertv2.0")
+        if model is None:model=load_colbert()
         return colbert_encode(model,values,is_query,32)
-    qids=list(dict.fromkeys(q for q,_ in pairs));dids=list(dict.fromkeys(d for _,d in pairs));qtexts=[queries[q].text for q in qids];dtexts=[(getattr(docs[d],"title","")+" "+docs[d].text).strip() for d in dids];qvalues,qcache=cached_ragged(a.cache_dir,"colbert-ir/colbertv2.0","query",qids,qtexts,lambda:encode(qtexts,True),a.refresh_cache);dvalues,dcache=cached_ragged(a.cache_dir,"colbert-ir/colbertv2.0","document",dids,dtexts,lambda:encode(dtexts,False),a.refresh_cache);qvec=dict(zip(qids,qvalues));dvec=dict(zip(dids,dvalues))
+    qids=list(dict.fromkeys(q for q,_ in pairs));dids=list(dict.fromkeys(d for _,d in pairs));qtexts=[queries[q].text for q in qids];dtexts=[(getattr(docs[d],"title","")+" "+docs[d].text).strip() for d in dids];qvalues,qcache=cached_ragged(a.cache_dir,MODEL_ID,"query",qids,qtexts,lambda:encode(qtexts,True),a.refresh_cache,cache_config("query"));dvalues,dcache=cached_ragged(a.cache_dir,MODEL_ID,"document",dids,dtexts,lambda:encode(dtexts,False),a.refresh_cache,cache_config("document"));qvec=dict(zip(qids,qvalues));dvec=dict(zip(dids,dvalues))
     root=Path(__file__).resolve().parents[1];server=subprocess.Popen(["cargo","run","--release","--bin","multivector","--","--dimension","128","--centroids",str(a.centroids),"--probes","8","--path",str(a.index),"--listen","127.0.0.1:18080"],cwd=root,stdout=subprocess.DEVNULL);base="http://127.0.0.1:18080"
     try:
         for _ in range(60):

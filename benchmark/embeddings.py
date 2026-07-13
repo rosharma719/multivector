@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-CACHE_SCHEMA = 1
+CACHE_SCHEMA = 2
 ENCODER_PACKAGES = ("numpy", "pylate", "sentence-transformers", "torch", "transformers")
 
 
@@ -68,7 +68,7 @@ def _input_fingerprint(ids, texts):
     return digest.hexdigest()
 
 
-def _identity(model_id, role, ids, texts, normalized):
+def _identity(model_id, role, ids, texts, normalized, encoder_config=None):
     return {
         "schema": CACHE_SCHEMA,
         "model_id": model_id,
@@ -78,6 +78,7 @@ def _identity(model_id, role, ids, texts, normalized):
         "items": len(ids),
         "input_fingerprint": _input_fingerprint(ids, texts),
         "encoder_packages": _package_versions(),
+        "encoder_config": encoder_config or {},
     }
 
 
@@ -98,8 +99,12 @@ def _info(path, key, identity, hit):
     }
 
 
-def cached_ragged(root, model_id, role, ids, texts, encoder, refresh=False):
-    identity = _identity(model_id, role, ids, texts, normalized=True)
+def cached_ragged(
+    root, model_id, role, ids, texts, encoder, refresh=False, encoder_config=None
+):
+    identity = _identity(
+        model_id, role, ids, texts, normalized=True, encoder_config=encoder_config
+    )
     path, key = _location(Path(root), "ragged", identity)
     manifest_path = path / "manifest.json"
     if manifest_path.exists() and not refresh:

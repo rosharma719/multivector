@@ -8,18 +8,19 @@ import time
 from pathlib import Path
 
 import numpy as np
-from pylate import models
-
+from colbert_config import MODEL_ID, cache_config, load as load_colbert
 from data import load_slice
 from embeddings import cached_ragged
 from provenance import write_report
 from run import colbert_encode, http, score
 
 
-def report_for(queries, vectors, qrels, base, backend, candidates, probes, ef_search):
+def report_for(queries, vectors, qrels, base, backend, candidates, probes, ef_search, documents, rerank_candidates):
     run, latency = {}, []
     for query, vector in zip(queries, vectors):
         body = {"vectors": np.asarray(vector).tolist(), "top_k": 100, "candidates": candidates}
+        if rerank_candidates is not None:
+            body["rerank_candidates"] = rerank_candidates
         if backend == "centroid":
             body["probes"] = probes
         if backend == "hnsw":
@@ -35,6 +36,9 @@ def report_for(queries, vectors, qrels, base, backend, candidates, probes, ef_se
         "probes": probes if backend == "centroid" else None,
         "ef_search": ef_search if backend == "hnsw" else None,
         "candidates": candidates,
+        "candidate_fraction": candidates / documents,
+        "rerank_candidates": rerank_candidates,
+        "rerank_fraction": None if rerank_candidates is None else rerank_candidates / documents,
         **score(run, qrels),
         "p50_ms": float(np.percentile(latency, 50) * 1000),
         "p95_ms": float(np.percentile(latency, 95) * 1000),
@@ -58,6 +62,7 @@ def main():
     parser.add_argument("--hnsw-m", type=int, default=16)
     parser.add_argument("--candidates", type=int, default=100)
     parser.add_argument("--candidate-grid", type=int, nargs="+")
+    parser.add_argument("--rerank-candidates", type=int)
     parser.add_argument("--report-dir", type=Path, default=Path("benchmark/reports"))
     parser.add_argument("--cache-dir", type=Path, default=Path("benchmark/cache"))
     parser.add_argument("--refresh-cache", action="store_true")
@@ -66,21 +71,22 @@ def main():
     if args.output is not None:
         print("--output is deprecated and ignored; appending to the version ledger", file=sys.stderr)
 
-    _, queries, qrels = load_slice(
+    docs, queries, qrels = load_slice(
         args.dataset, args.limit_docs, args.limit_queries, args.sampling, args.sample_seed
     )
 
     query_texts = [query.text for query in queries]
     vectors, query_cache = cached_ragged(
         args.cache_dir,
-        "colbert-ir/colbertv2.0",
+        MODEL_ID,
         "query",
         [query.query_id for query in queries],
         query_texts,
         lambda: colbert_encode(
-            models.ColBERT(model_name_or_path="colbert-ir/colbertv2.0"), query_texts, True, 32
+            load_colbert(), query_texts, True, 32
         ),
         args.refresh_cache,
+        cache_config("query"),
     )
     root = Path(__file__).resolve().parents[1]
     command = ["cargo", "run", "--release", "--bin", "multivector", "--", "--dimension", "128", "--centroids", str(args.centroids), "--probes", str(args.configured_probes), "--path", str(args.index), "--listen", "127.0.0.1:18080"]
@@ -103,7 +109,10 @@ def main():
         for candidate_count in candidates:
             searches = ef_searches if args.backend == "hnsw" else [args.ef_search]
             for ef_search in searches:
-                report = report_for(queries, vectors, qrels, base, args.backend, candidate_count, args.probes, ef_search)
+                report = report_for(
+                    queries, vectors, qrels, base, args.backend, candidate_count,
+                    args.probes, ef_search, len(docs), args.rerank_candidates,
+                )
                 report["dataset"] = args.dataset
                 report["sampling"] = args.sampling
                 report["sample_seed"] = args.sample_seed

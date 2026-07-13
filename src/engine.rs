@@ -379,6 +379,32 @@ impl MultiVectorIndex {
         let s = self.state.read().unwrap();
         self.rescore(&s, &normalized, approximate, top_k, candidates)
     }
+    /// Generate broad FDE candidates, prune with centroid-only MaxSim, then
+    /// decode residuals only for the surviving documents.
+    pub fn query_with_centroid_pruning(
+        &self,
+        vectors: &[Vector],
+        top_k: usize,
+        candidates: usize,
+        rerank_candidates: usize,
+    ) -> Result<Vec<Hit>, IndexError> {
+        self.validate(vectors)?;
+        if top_k == 0 || rerank_candidates < top_k || candidates < rerank_candidates {
+            return Err(IndexError::Invalid(
+                "require top_k > 0 and candidates >= rerank_candidates >= top_k".into(),
+            ));
+        }
+        let normalized: Vec<_> = vectors.iter().map(|vector| normalize(vector)).collect();
+        let approximate = self.exact_fde_scores(&normalized)?;
+        let s = self.state.read().unwrap();
+        let pruned = centroid_prune(
+            &s,
+            &normalized,
+            approximate.into_iter().take(candidates).collect(),
+            rerank_candidates,
+        );
+        self.rescore(&s, &normalized, pruned, top_k, Some(rerank_candidates))
+    }
     fn exact_fde_scores(&self, normalized: &[Vector]) -> Result<Vec<(String, f32)>, IndexError> {
         let query_fde = self.fde.encode_query(normalized);
         let s = self.state.read().unwrap();
@@ -398,7 +424,7 @@ impl MultiVectorIndex {
             })
             .collect();
         let mut approximate = approximate_results?;
-        approximate.par_sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        approximate.par_sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         Ok(approximate)
     }
     /// Return exact FDE candidates before compressed MaxSim reranking.
@@ -565,7 +591,7 @@ impl MultiVectorIndex {
                 (id, score)
             })
             .collect();
-        approx.sort_by(|a, b| b.1.total_cmp(&a.1));
+        approx.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         self.rescore(&s, &normalized, approx, top_k, candidates)
     }
     fn rescore(
@@ -644,6 +670,38 @@ impl MultiVectorIndex {
         )?;
         Ok(maxsim_flat(&query, &document.values, document.dimension))
     }
+}
+
+fn centroid_prune(
+    s: &State,
+    query: &[Vector],
+    candidates: Vec<(String, f32)>,
+    survivors: usize,
+) -> Vec<(String, f32)> {
+    let interaction: Vec<Vec<f32>> = query
+        .iter()
+        .map(|q| s.codebook.iter().map(|centroid| dot(q, centroid)).collect())
+        .collect();
+    let mut scored: Vec<_> = candidates
+        .into_par_iter()
+        .map(|(id, _)| {
+            let document = &s.documents[&id];
+            let score = interaction
+                .iter()
+                .map(|row| {
+                    document
+                        .unique_centroids
+                        .iter()
+                        .map(|&centroid| row[centroid as usize])
+                        .fold(f32::NEG_INFINITY, f32::max)
+                })
+                .sum::<f32>();
+            (id, score)
+        })
+        .collect();
+    scored.par_sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    scored.truncate(survivors);
+    scored
 }
 fn nearest(vector: &Vector, centroids: &[Vector]) -> usize {
     centroids
