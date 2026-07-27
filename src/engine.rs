@@ -389,21 +389,45 @@ impl MultiVectorIndex {
         rerank_candidates: usize,
     ) -> Result<Vec<Hit>, IndexError> {
         self.validate(vectors)?;
-        if top_k == 0 || rerank_candidates < top_k || candidates < rerank_candidates {
-            return Err(IndexError::Invalid(
-                "require top_k > 0 and candidates >= rerank_candidates >= top_k".into(),
-            ));
-        }
+        check_pruning_shape(top_k, candidates, rerank_candidates)?;
         let normalized: Vec<_> = vectors.iter().map(|vector| normalize(vector)).collect();
         let approximate = self.exact_fde_scores(&normalized)?;
         let s = self.state.read().unwrap();
-        let pruned = centroid_prune(
-            &s,
-            &normalized,
-            approximate.into_iter().take(candidates).collect(),
-            rerank_candidates,
-        );
-        self.rescore(&s, &normalized, pruned, top_k, Some(rerank_candidates))
+        self.prune_and_rescore(&s, &normalized, approximate, top_k, candidates, rerank_candidates)
+    }
+    /// Same pipeline as `query_with_centroid_pruning`, but pulls the broad
+    /// candidate set from the FDE HNSW graph instead of the exact FDE scan.
+    pub fn query_with_fde_ann_and_pruning(
+        &self,
+        vectors: &[Vector],
+        top_k: usize,
+        candidates: usize,
+        rerank_candidates: usize,
+        ef_search: usize,
+    ) -> Result<Vec<Hit>, IndexError> {
+        self.validate(vectors)?;
+        if ef_search == 0 {
+            return Err(IndexError::Invalid("ef_search must be positive".into()));
+        }
+        check_pruning_shape(top_k, candidates, rerank_candidates)?;
+        let normalized: Vec<_> = vectors.iter().map(|vector| normalize(vector)).collect();
+        let query_fde = self.fde.encode_query(&normalized);
+        let s = self.state.read().unwrap();
+        let approximate = self.ann_fde_scores(&s, &query_fde, candidates, ef_search)?;
+        self.prune_and_rescore(&s, &normalized, approximate, top_k, candidates, rerank_candidates)
+    }
+    fn prune_and_rescore(
+        &self,
+        s: &State,
+        normalized: &[Vector],
+        approximate: Vec<(String, f32)>,
+        top_k: usize,
+        candidates: usize,
+        rerank_candidates: usize,
+    ) -> Result<Vec<Hit>, IndexError> {
+        let broad: Vec<_> = approximate.into_iter().take(candidates).collect();
+        let pruned = centroid_prune(s, normalized, broad, rerank_candidates);
+        self.rescore(s, normalized, pruned, top_k, Some(rerank_candidates))
     }
     fn exact_fde_scores(&self, normalized: &[Vector]) -> Result<Vec<(String, f32)>, IndexError> {
         let query_fde = self.fde.encode_query(normalized);
@@ -672,6 +696,18 @@ impl MultiVectorIndex {
     }
 }
 
+fn check_pruning_shape(
+    top_k: usize,
+    candidates: usize,
+    rerank_candidates: usize,
+) -> Result<(), IndexError> {
+    if top_k == 0 || rerank_candidates < top_k || candidates < rerank_candidates {
+        return Err(IndexError::Invalid(
+            "require top_k > 0 and candidates >= rerank_candidates >= top_k".into(),
+        ));
+    }
+    Ok(())
+}
 fn centroid_prune(
     s: &State,
     query: &[Vector],

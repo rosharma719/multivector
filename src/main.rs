@@ -149,12 +149,21 @@ async fn query(
     Json(body): Json<QueryRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let matches = match body.candidate_backend.as_deref() {
-        Some("hnsw") => index.query_with_fde_ann(
-            &body.vectors,
-            body.top_k,
-            body.candidates,
-            body.ef_search.unwrap_or(256),
-        )?,
+        Some("hnsw") => match body.rerank_candidates {
+            Some(rerank_candidates) => index.query_with_fde_ann_and_pruning(
+                &body.vectors,
+                body.top_k,
+                body.candidates.unwrap_or(rerank_candidates),
+                rerank_candidates,
+                body.ef_search.unwrap_or(256),
+            )?,
+            None => index.query_with_fde_ann(
+                &body.vectors,
+                body.top_k,
+                body.candidates,
+                body.ef_search.unwrap_or(256),
+            )?,
+        },
         Some("muvera") | None => match (body.probes, body.rerank_candidates) {
             (None, Some(rerank_candidates)) => index.query_with_centroid_pruning(
                 &body.vectors,

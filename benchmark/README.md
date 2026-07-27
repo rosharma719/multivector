@@ -184,3 +184,32 @@ resolution, not the pruning mechanism, was the ceiling. 2:1 pruning (2,000 →
 Direct-500 nDCG@10 is roughly flat across codebook sizes (0.6711–0.6806) within
 paired-bootstrap noise, so larger codebooks pay for themselves through pruning
 headroom rather than through the direct path.
+
+The same c=1,024 pruning matrix on FiQA (10,000 documents, 100 qrels-sampled
+queries) reproduces the finding more strongly:
+
+| candidates | rerank_candidates | nDCG@10 | recall@10 | p50 ms |
+| ---: | ---: | ---: | ---: | ---: |
+| 500 | — | 0.4491 | 0.5274 | 71.7 |
+| 1,000 | — | 0.4598 | 0.5404 | 119.2 |
+| 2,000 | — | 0.4670 | 0.5545 | 221.5 |
+| 2,000 | 500 | 0.4670 | 0.5545 | 67.2 |
+| 2,000 | 1,000 | 0.4670 | 0.5545 | 106.5 |
+
+On FiQA, 2,000→500 pruning matches direct-2,000 exactly on both nDCG@10 and
+recall@10, so the top-10 rankings are identical across all 100 queries — the
+centroid ranking at c=1,024 preserves the whole rerank-relevant portion of the
+top-2,000. The latency win is 3.3× vs direct-2,000, and quality strictly
+exceeds direct-500. This is stronger than SciFact (where 2,000→500 was within
+0.001 nDCG of direct-2,000, not identical), consistent with the codebook-scale
+hypothesis: centroid ranking fidelity, not the pruning mechanism, is the
+bottleneck.
+
+Two operational notes from these runs:
+- Building c=1,024 costs ~4× the k-means and per-token nearest-centroid work of
+  c=256, but that's dwarfed by ColBERT encoding on CPU when the cache misses.
+  Warm the embedding cache before comparing codebook sizes.
+- Centroid pruning also works with the HNSW candidate backend: pass
+  `candidate_backend: "hnsw"` together with `rerank_candidates` and the same
+  broad-fetch → centroid-prune → residual-rerank pipeline runs, sourcing broad
+  candidates from the FDE ANN graph instead of the exact FDE scan.

@@ -77,6 +77,19 @@ fn late_interaction_persists_and_ranks() {
             .id,
         "code"
     );
+    assert_eq!(
+        index
+            .query_with_fde_ann_and_pruning(
+                &[vec![1., 0., 0.], vec![0., 1., 0.]],
+                1,
+                2,
+                1,
+                16,
+            )
+            .unwrap()[0]
+            .id,
+        "code"
+    );
     drop(index);
     let restored = MultiVectorIndex::open(directory.path(), config).unwrap();
     assert_eq!(
